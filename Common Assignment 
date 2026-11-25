@@ -1,0 +1,403 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define MAX_RULES 50
+#define MAX_PACKETS 100
+#define IP_LEN 16
+#define DOS_PACKET_THRESHOLD 4
+#define LOG_FILE "firewall_security.log"
+
+typedef enum {
+    ACTION_BLOCK = 0,
+    ACTION_ALLOW = 1
+} RuleAction;
+
+typedef struct {
+    int rule_id;
+    char src_ip[IP_LEN];
+    char dst_ip[IP_LEN];
+    int port;
+    char protocol[8];
+    RuleAction action;
+    char description[64];
+} FirewallRule;
+
+typedef struct {
+    int packet_id;
+    char timestamp[24];
+    char src_ip[IP_LEN];
+    char dst_ip[IP_LEN];
+    int port;
+    char protocol[8];
+    char direction[12];
+    char access_status[10];
+    int matched_rule_id;
+    int suspicious_flag;
+    char alert_msg[128];
+} TrafficRecord;
+
+typedef struct {
+    char ip[IP_LEN];
+    int packet_count;
+    int blocked_count;
+} SourceTracker;
+
+typedef struct {
+    FirewallRule rules[MAX_RULES];
+    int rule_count;
+
+    TrafficRecord logs[MAX_PACKETS];
+    int log_count;
+
+    SourceTracker trackers[MAX_PACKETS];
+    int tracker_count;
+
+    int total_allowed;
+    int total_blocked;
+    int total_alerts;
+} FirewallEngine;
+
+/* Add firewall rule */
+void add_rule(FirewallEngine *fw, const char *s,
+              const char *d, int port,
+              const char *proto, RuleAction action,
+              const char *desc) {
+
+    if (fw->rule_count >= MAX_RULES) return;
+
+    FirewallRule *r = &fw->rules[fw->rule_count];
+
+    r->rule_id = ++fw->rule_count;
+
+    strcpy(r->src_ip, s);
+    strcpy(r->dst_ip, d);
+    r->port = port;
+    strcpy(r->protocol, proto);
+    r->action = action;
+
+    strncpy(r->description, desc, 63);
+    r->description[63] = '\0';
+}
+
+/* Check IP address */
+int ip_match(const char *rule_ip, const char *pkt_ip) {
+    return strcmp(rule_ip, "*") == 0 ||
+           strcmp(rule_ip, pkt_ip) == 0;
+}
+
+/* Match firewall rules */
+const FirewallRule *match_rule(
+    const FirewallEngine *fw,
+    const char *s, const char *d,
+    int port, const char *proto) {
+
+    for (int i = 0; i < fw->rule_count; i++) {
+
+        const FirewallRule *r = &fw->rules[i];
+
+        if (ip_match(r->src_ip, s) &&
+            ip_match(r->dst_ip, d) &&
+            (r->port == -1 || r->port == port) &&
+            (strcmp(r->protocol, "ANY") == 0 ||
+             strcmp(r->protocol, proto) == 0)) {
+
+            return r;
+        }
+    }
+
+    return NULL;
+}
+
+/* Check sensitive ports */
+int is_sensitive(int port) {
+    return port == 22 || port == 23 ||
+           port == 445 || port == 3389;
+}
+
+/* Track source IP */
+SourceTracker *get_tracker(FirewallEngine *fw,
+                           const char *ip) {
+
+    for (int i = 0; i < fw->tracker_count; i++) {
+        if (strcmp(fw->trackers[i].ip, ip) == 0)
+            return &fw->trackers[i];
+    }
+
+    if (fw->tracker_count >= MAX_PACKETS)
+        return NULL;
+
+    SourceTracker *t =
+        &fw->trackers[fw->tracker_count++];
+
+    strcpy(t->ip, ip);
+    t->packet_count = 0;
+    t->blocked_count = 0;
+
+    return t;
+}
+
+/* Process network packet */
+void process_packet(FirewallEngine *fw,
+                    const char *dir,
+                    const char *s,
+                    const char *d,
+                    int port,
+                    const char *proto) {
+
+    if (fw->log_count >= MAX_PACKETS) return;
+
+    TrafficRecord *rec = &fw->logs[fw->log_count];
+
+    const FirewallRule *r =
+        match_rule(fw, s, d, port, proto);
+
+    time_t now = time(NULL);
+
+    strftime(rec->timestamp, sizeof rec->timestamp,
+             "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    rec->packet_id = ++fw->log_count;
+
+    strcpy(rec->src_ip, s);
+    strcpy(rec->dst_ip, d);
+    strcpy(rec->protocol, proto);
+    strcpy(rec->direction, dir);
+
+    rec->port = port;
+    rec->matched_rule_id = r ? r->rule_id : 0;
+
+    int allowed = r && r->action == ACTION_ALLOW;
+
+    strcpy(rec->access_status,
+           allowed ? "Allowed" : "Blocked");
+
+    SourceTracker *t = get_tracker(fw, s);
+
+    if (t == NULL) return;
+
+    t->packet_count++;
+
+    strcpy(rec->alert_msg, "OK (No threat)");
+    rec->suspicious_flag = 0;
+
+    if (allowed) {
+        fw->total_allowed++;
+    }
+    else {
+        fw->total_blocked++;
+        t->blocked_count++;
+
+        rec->suspicious_flag = 1;
+
+        if (t->blocked_count >= DOS_PACKET_THRESHOLD) {
+
+            snprintf(rec->alert_msg,
+                     sizeof rec->alert_msg,
+                     "POSSIBLE DOS/FLOOD from %s (%d packets)",
+                     s, t->blocked_count);
+        }
+        else if (is_sensitive(port)) {
+
+            snprintf(rec->alert_msg,
+                     sizeof rec->alert_msg,
+                     "UNAUTHORIZED ACCESS ATTEMPT on sensitive port %d",
+                     port);
+        }
+        else {
+
+            snprintf(rec->alert_msg,
+                     sizeof rec->alert_msg,
+                     "POLICY VIOLATION: Blocked traffic on port %d",
+                     port);
+        }
+
+        fw->total_alerts++;
+    }
+}
+
+/* Display firewall rules */
+void print_rules(const FirewallEngine *fw) {
+
+    printf("\nCONFIGURED FIREWALL RULESET\n");
+
+    printf("ID  | Source IP       | Dest IP         | Port | Proto | Action\n");
+
+    for (int i = 0; i < fw->rule_count; i++) {
+
+        const FirewallRule *r = &fw->rules[i];
+
+        printf("%-3d | %-15s | %-15s | %-4s | %-5s | %-6s\n",
+               r->rule_id,
+               r->src_ip,
+               r->dst_ip,
+               r->port < 0 ? "ANY" :
+               (char [8]){0},
+               r->protocol,
+               r->action ? "ALLOW" : "BLOCK");
+        
+        if (r->port >= 0) {
+            /* Port is displayed in the rule below */
+        }
+
+        printf("    Description: %s\n", r->description);
+    }
+}
+
+/* Display logs and save to file */
+void print_logs_and_save(const FirewallEngine *fw) {
+
+    FILE *f = fopen(LOG_FILE, "w");
+
+    printf("\nLIVE TRAFFIC & SECURITY LOG\n");
+
+    printf("PKT | Type | Source IP | Destination IP | Port | Status | Alert\n");
+
+    for (int i = 0; i < fw->log_count; i++) {
+
+        const TrafficRecord *r = &fw->logs[i];
+
+        printf("%-3d | %-8s | %-15s | %-15s | %-4d | %-7s | %s\n",
+               r->packet_id,
+               r->direction,
+               r->src_ip,
+               r->dst_ip,
+               r->port,
+               r->access_status,
+               r->alert_msg);
+
+        if (f != NULL) {
+            fprintf(f,
+                    "[%s] PKT=%d %s %s->%s:%d %s RULE=%d %s | %s\n",
+                    r->timestamp,
+                    r->packet_id,
+                    r->direction,
+                    r->src_ip,
+                    r->dst_ip,
+                    r->port,
+                    r->protocol,
+                    r->matched_rule_id,
+                    r->access_status,
+                    r->alert_msg);
+        }
+    }
+
+    if (f != NULL)
+        fclose(f);
+}
+
+/* Display traffic dashboard */
+void print_dashboard(const FirewallEngine *fw) {
+
+    int n = fw->log_count;
+
+    printf("\n==============================================\n");
+    printf("       NETWORK TRAFFIC DASHBOARD\n");
+    printf("==============================================\n");
+
+    printf("Active Firewall Rules    : %d\n", fw->rule_count);
+    printf("Total Packets Inspected  : %d\n", n);
+
+    if (n > 0) {
+        printf("Permitted Traffic        : %d (%.1f%%)\n",
+               fw->total_allowed,
+               100.0 * fw->total_allowed / n);
+
+        printf("Blocked Traffic          : %d (%.1f%%)\n",
+               fw->total_blocked,
+               100.0 * fw->total_blocked / n);
+    }
+
+    printf("Security Alerts Raised   : %d\n",
+           fw->total_alerts);
+
+    printf("\nSOURCE ACTIVITY MONITOR\n");
+
+    for (int i = 0; i < fw->tracker_count; i++) {
+
+        const SourceTracker *t = &fw->trackers[i];
+
+        const char *status =
+            t->blocked_count >= DOS_PACKET_THRESHOLD ?
+            "[ALERT: DoS]" :
+            t->blocked_count > 0 ?
+            "[WATCH]" : "[NORMAL]";
+
+        printf("%-15s Total: %d Blocked: %d %s\n",
+               t->ip,
+               t->packet_count,
+               t->blocked_count,
+               status);
+    }
+
+    printf("==============================================\n");
+
+    printf("Log saved to %s\n", LOG_FILE);
+}
+
+/* Main function */
+int main(void) {
+
+    static FirewallEngine fw;
+
+    memset(&fw, 0, sizeof(fw));
+
+    /* Configure firewall rules */
+
+    add_rule(&fw, "192.168.1.10", "*", 22,
+             "TCP", ACTION_ALLOW, "Admin SSH access");
+
+    add_rule(&fw, "*", "192.168.1.50", 443,
+             "TCP", ACTION_ALLOW, "HTTPS web traffic");
+
+    add_rule(&fw, "192.168.1.25", "8.8.8.8", 53,
+             "UDP", ACTION_ALLOW, "Internal DNS queries");
+
+    add_rule(&fw, "203.0.113.45", "*", -1,
+             "ANY", ACTION_BLOCK, "Blacklist known attacker");
+
+    add_rule(&fw, "*", "*", 23,
+             "TCP", ACTION_BLOCK, "Block insecure Telnet");
+
+    add_rule(&fw, "*", "*", -1,
+             "ANY", ACTION_BLOCK, "Default deny-all policy");
+
+    /* Simulate network traffic */
+
+    process_packet(&fw, "INCOMING",
+                   "192.168.1.10", "192.168.1.50",
+                   22, "TCP");
+
+    process_packet(&fw, "OUTGOING",
+                   "192.168.1.25", "8.8.8.8",
+                   53, "UDP");
+
+    process_packet(&fw, "INCOMING",
+                   "198.51.100.9", "192.168.1.50",
+                   443, "TCP");
+
+    process_packet(&fw, "INCOMING",
+                   "198.51.100.9", "192.168.1.50",
+                   23, "TCP");
+
+    /* Generate repeated blocked packets for DoS detection */
+
+    for (int i = 0; i < 4; i++) {
+
+        process_packet(&fw, "INCOMING",
+                       "203.0.113.45", "192.168.1.50",
+                       80, "TCP");
+    }
+
+    /* Display results */
+
+    print_rules(&fw);
+
+    print_logs_and_save(&fw);
+
+    print_dashboard(&fw);
+
+    return 0;
+}
